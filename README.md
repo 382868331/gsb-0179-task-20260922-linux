@@ -1,8 +1,14 @@
-# TSN 门控发送验证(tsn_gate)
+# TSN 门控发送验证(tsn_gate)+ 多跳排程合成(hop_schedule)
 
-离线、确定性的时间敏感网络(TSN)门控发送重放模块。给定帧到达序列与周期门控表,
-计算每帧的发送开始/结束时刻、等待原因与 deadline 违例;任何窗口都容纳不下的帧
-被证明并标记为“永不可发”,不会死循环。
+本仓库包含两个离线、确定性的纯整数纳秒模块(仅标准库):
+
+1. **tsn_gate**:单链路门控发送重放。给定帧到达序列与周期门控表,
+   计算每帧的发送开始/结束时刻、等待原因与 deadline 违例;任何窗口都容纳不下的帧
+   被证明并标记为“永不可发”,不会死循环。
+2. **hop_schedule**(本次新增):多跳存储转发排程合成。给定固定路径的周期流
+   (整数周期、发送时长、端到端截止期),完整枚举合成逐跳发送时刻,
+   同一链路任意周期实例不冲突;成功时返回可用 tsn_gate.replay 逐链路重放的
+   门表排程;无解与预算不足是两种不同的结论,严格分开。
 
 ## 环境
 
@@ -88,7 +94,7 @@ result = replay(arrivals, schedule, max_events=1_000_000)
 
 ## 误差口径
 
-本模块不使用浮点:所有时间为整数纳秒,序列化时长为精确整数上取整
+两个模块均不使用浮点:所有时间为整数纳秒,序列化时长为精确整数上取整
 `ceil(size_bytes*8/rate)`,输出不存在浮点误差,测试按精确相等断言。
 
 ## 已知限制
@@ -98,11 +104,97 @@ result = replay(arrivals, schedule, max_events=1_000_000)
 - guard 为全局单值;deadline 违例只报告不阻止发送。
 - 等待原因为定性标签(出现过的原因集合),不输出逐段等待时间线。
 
+# 多跳存储转发排程合成(hop_schedule)
+
+给定固定路径的周期流集合与链路速率,合成每条流逐跳的发送时刻,
+使得:存储转发先后有序、各流末跳在截止期前结束、同一链路上任意两条流的
+任意周期实例互不重叠。找到则返回**可重放**排程(每条链路附带一个
+`GateSchedule` + 帧列表,用 `tsn_gate.replay` 重放必然复现合成时刻,
+合成后已逐链路实测校验);无解与预算不足分别抛出不同异常。
+
+## 接口
+
+```python
+from hop_schedule import Flow, Network, Link, synthesize
+
+network = Network(
+    links=(Link("A", "B"), Link("B", "C")),   # 有向链路 "源->目的"
+    default_rate_bits_per_ns=8,               # 缺省链路速率(8 = 1B/ns)
+    default_guard_ns=0,                       # 缺省 guard(只影响重放窗口长度)
+    # link_rates_bits_per_ns={"B->C": 4},     # 可选:逐链路覆盖
+    # link_guards_ns={"A->B": 5},
+)
+flows = [
+    Flow(name="f0", path=("A", "B", "C"),     # 固定路径,1..3 个传输跳
+         period_ns=100,                       # 整数周期
+         deadline_ns=60,                      # 相对截止期:末跳结束 <= offset+deadline
+         sizes_bytes=10,                      # 每跳字节数:int 或逐跳元组
+         offset_ns=0),                        # 首发释放时刻(默认 0)
+]
+schedule = synthesize(flows, network)         # 可加 max_search_ns= / max_nodes=
+```
+
+`MultiHopSchedule` 主要内容:
+
+| 字段/方法 | 含义 |
+| --- | --- |
+| `hyperperiod_ns` | 超周期 `lcm(所有周期)`;排程按此周期无限重复 |
+| `flows[i].hops[h]` | `HopSchedule(flow, hop_index, link, start_ns, end_ns, duration_ns)` |
+| `links` / `hops` | 实际使用的链路;全部跳按 `(开始,链路,流,跳序)` 排序 |
+| `link_replays[link]` | `LinkReplay`:该链路的 `GateSchedule`、帧、期望时刻与实测 `ReplayResult` |
+| `replay_link(link)` / `replay_all()` | 用 tsn_gate.replay 重新重放(纯计算,不改排程) |
+
+另有便捷入口 `replay_schedule(schedule)` 等价于 `schedule.replay_all()`。
+
+## 语义约定
+
+- 所有时间为整数纳秒,时从 0 开始;跳 h 的序列化时长 =
+  `ceil(size_bytes[h]*8 / rate_link)`,精确整数。
+- 存储转发:第 h 跳最早在第 h-1 跳结束时刻开始(第 0 跳最早为 `offset_ns`)。
+- 周期实例:每跳在 t 发送后,后续实例在 `t + k*period` 发送;两条周期区间列
+  是否冲突用模运算判据 O(1) 判定(`r=(t1-t2) mod gcd(p1,p2)` 落在对方时长
+  窗口内即冲突),与“超周期内逐实例展开比较”数学等价(测试中与独立展开对拍)。
+- 流的相邻周期实例不得自我重叠:任一跳时长 > 该流周期时直接判定无解。
+- 可重放门表:每条链路一个 `GateSchedule`,每个 (流,链路) 恰好一个窗口
+  `[t, t+时长+guard)`,窗口在排程起点才打开;按窗口起点归纳可证 replay 中
+  每帧恰在 t 发送,合成后逐链路实测复核,不符即报内部错误。
+
+## 结论与错误语义(三种结论严格分开)
+
+- **成功**:返回 `MultiHopSchedule`(含可重放门表)。
+- **无解**:`InfeasibleError`——完整枚举穷尽后的证明。枚举是完备的:
+  每跳候选起点稠密取遍 `[存储转发最早, 截止期允许最晚]` 内每个整数 ns,
+  DFS 穷尽即不存在可行排程。
+- **预算不足**:`BudgetExhaustedError`——超周期或最晚截止时刻超过
+  `max_search_ns`(默认 200 000),或搜索节点超过 `max_nodes`
+  (默认 200 000)。搜索被截断或未执行,**不是**无解的证明;可显式调大重试。
+- **非法输入**:`TSNGateError`,消息带 `flows[i].field` 定位;先完整校验
+  再搜索,任何失败路径都不产生部分结果,也不修改入参。
+
+## 输入上限
+
+- 流最多 `MAX_FLOWS=4` 条;每条路径 2..4 个节点(即 `MAX_HOPS=3` 个传输跳),
+  路径不得成环;路径使用的链路必须已在 `Network.links` 声明。
+- `period_ns >= 1`,`offset_ns >= 0`,`deadline_ns >= 1`,`sizes_bytes >= 1`;
+  整数参数拒绝 `bool`/浮点/NaN/Infinity(与 tsn_gate 同口径)。
+- 超周期 `lcm(周期)` 与最晚绝对截止时刻均不得超过 `max_search_ns`
+  (题面限定“短超周期”;默认 200 000ns)。
+
+## 设计取舍与已知限制
+
+- **完备枚举而非启发式**:4 流 × 3 跳 × 短超周期内逐 ns 枚举全部候选,
+  找到的第一个可行解即返回(不优化任何目标,不保证空隙最小或最早完成)。
+- 不做在线配置切换、保护带联合优化、最优性证书;guard 只用于生成重放窗口,
+  不参与冲突判定(冲突按发送区间 `[t, t+时长)` 判定,半开、相切不冲突)。
+- 流的首个实例之前的瞬态按同一周期模式保守处理(稳态超周期模型)。
+- 稠密枚举的成本随时间轴长度增长;病态输入(超大超周期/截止期)由
+  `max_search_ns`/`max_nodes` 预算拦截,不会失控。
+
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 单元测试 + 与独立逐 tick 参考的随机对照
-python demo.py                            # 演示:门控造成的错过窗口 + 非法输入拒绝
+python -m unittest discover -s tests -v   # 全部测试:旧重放 + 新合成(含独立参考对拍)
+python demo.py                            # 演示:正常合成+重放、边界、无解/预算/非法输入
 ```
 
-两条命令均在数秒内完成,全程离线。
+两条命令均在数秒内完成(实测 < 1s),全程离线。
