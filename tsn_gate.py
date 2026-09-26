@@ -35,9 +35,11 @@ __all__ = [
     "Frame",
     "GateWindow",
     "GateSchedule",
+    "PreemptionConfig",
     "FrameResult",
     "ReplayResult",
     "replay",
+    "replay_preemptive",
 ]
 
 MAX_QUEUES = 4
@@ -57,6 +59,7 @@ class WaitReason(str, Enum):
     INSUFFICIENT_WINDOW = "insufficient-window"  # 门开着但剩余窗口容不下 时长+guard
     LINK_BUSY = "link-busy"                    # 链路被其他帧占用(不可抢占)
     OUTRANKED = "outranked"                    # 同时可发但优先级/到达序号靠后
+    PREEMPTED = "preempted"                    # 片段边界处被紧急帧抢占,暂停等待恢复
 
 
 class FrameStatus(str, Enum):
@@ -175,6 +178,9 @@ class FrameResult:
     wait_reasons: tuple           # 等待期间出现过的原因(WaitReason,按首次出现排序)
     deadline_ns: int | None
     deadline_violated: bool       # end_ns > deadline_ns(帧仍发送,不丢弃)
+    fragments: tuple = ()         # 抢占模式下每片的 (start_ns, end_ns);旧模式为 ()
+    preempted_count: int = 0      # 在片段边界被紧急帧抢占而暂停的次数
+    overhead_bytes: int = 0       # 恢复片段引入的额外开销字节总数
 
 
 @dataclass(frozen=True)
@@ -332,6 +338,266 @@ def replay(arrivals, gate_schedule, *, max_events=DEFAULT_MAX_EVENTS) -> ReplayR
                 waited_ns=start_of[i] - arrive_of[i],
                 wait_reasons=tuple(reasons[i]),
                 deadline_ns=deadline_of[i], deadline_violated=violated,
+            ))
+    return ReplayResult(
+        frames=tuple(frames_out),
+        sent_count=sum(1 for i in range(n) if transmittable[i]),
+        never_count=sum(1 for i in range(n) if not transmittable[i]),
+        deadline_violations=tuple(
+            i for i in range(n) if transmittable[i] and frames_out[i].deadline_violated
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class PreemptionConfig:
+    """帧抢占配置(express / preemptable 两类队列)。
+
+    - express_queues: 紧急(express)队列集合;其余队列为可抢占(preemptable)。
+    - fragment_size_bytes: 可抢占帧的固定片段载荷大小(字节,>= 1);
+      普通帧只能在这种固定片段边界暂停。
+    - fragment_overhead_bytes: 每次恢复(第 2 片起)额外计入的开销字节数,>= 0。
+    """
+
+    express_queues: frozenset
+    fragment_size_bytes: int
+    fragment_overhead_bytes: int = 0
+
+    def __post_init__(self):
+        try:
+            qs = frozenset(self.express_queues)
+        except TypeError as exc:
+            raise TSNGateError(f"PreemptionConfig.express_queues: 不可迭代({exc})") from exc
+        for q in qs:
+            _require_int(q, "PreemptionConfig.express_queues[]", lo=0, hi=MAX_QUEUES - 1)
+        _require_int(self.fragment_size_bytes,
+                     "PreemptionConfig.fragment_size_bytes", lo=1)
+        _require_int(self.fragment_overhead_bytes,
+                     "PreemptionConfig.fragment_overhead_bytes", lo=0)
+        object.__setattr__(self, "express_queues", qs)
+
+
+def replay_preemptive(arrivals, gate_schedule, config, *,
+                      max_events=DEFAULT_MAX_EVENTS) -> ReplayResult:
+    """带帧抢占的重放:express 帧可在片段边界打断 preemptable 帧。
+
+    语义(在 replay 的公共约定之上):
+    - preemptable 帧按 fragment_size_bytes 切成固定片段;只能在片段边界暂停。
+      紧急帧到达后等到当前片段结束(下一个合法边界)再发送。
+    - 暂停帧保留剩余字节;恢复时(第 2 片起)每片额外计入
+      fragment_overhead_bytes 字节开销,占用链路时间。
+    - 门关闭不会截断已经开始的片段(片段必然跑到完成),但门关闭后
+      不能再开新片段:启动条件为 门开着 且 剩余窗口 > guard_ns。
+      紧急帧也必须满足自己的门,否则原地等待,可抢占帧可继续。
+    - 多个暂停帧按原开始顺序(首次开始时刻早者优先)恢复;
+      暂停帧优先于从未开始的可抢占帧。
+    - 同刻处理次序:片段完成 -> 门状态按新相位求值 -> 帧到达并入队 -> 启动决策。
+    - 同可发紧急帧竞争按 (到达时刻, 到达序号);新可抢占帧按 (队列号, 到达序号)。
+    - 永不可发的证明:该队列最长窗口 <= guard_ns(连一个片段都开不了)。
+    """
+    _require_int(max_events, "max_events", lo=1)
+    if not isinstance(gate_schedule, GateSchedule):
+        raise TSNGateError(
+            f"gate_schedule: 需要 GateSchedule,得到 {type(gate_schedule).__name__}"
+        )
+    if not isinstance(config, PreemptionConfig):
+        raise TSNGateError(
+            f"config: 需要 PreemptionConfig,得到 {type(config).__name__}"
+        )
+    try:
+        arrivals = list(arrivals)
+    except TypeError as exc:
+        raise TSNGateError(f"arrivals: 不可迭代({exc})") from exc
+
+    rate = gate_schedule.link_rate_bits_per_ns
+    guard = gate_schedule.guard_ns
+    cycle = gate_schedule.cycle_ns
+    offset = gate_schedule.clock_offset_ns
+    frag_size = config.fragment_size_bytes
+    frag_ov = config.fragment_overhead_bytes
+
+    n = len(arrivals)
+    queue_of, arrive_of, size_of, dur_of, deadline_of = [], [], [], [], []
+    for i, f in enumerate(arrivals):
+        if not isinstance(f, Frame):
+            raise TSNGateError(f"arrivals[{i}]: 需要 Frame,得到 {type(f).__name__}")
+        queue_of.append(_require_int(f.queue, f"arrivals[{i}].queue",
+                                     lo=0, hi=MAX_QUEUES - 1))
+        arrive_of.append(_require_int(f.arrive_ns, f"arrivals[{i}].arrive_ns", lo=0))
+        size = _require_int(f.size_bytes, f"arrivals[{i}].size_bytes", lo=1)
+        d = f.deadline_ns
+        if d is not None:
+            d = _require_int(d, f"arrivals[{i}].deadline_ns", lo=0)
+        deadline_of.append(d)
+        size_of.append(size)
+        dur_of.append((size * 8 + rate - 1) // rate)
+
+    qwin = [[] for _ in range(MAX_QUEUES)]
+    for w in gate_schedule.windows:
+        for q in w.queues:
+            qwin[q].append((w.start_ns, w.end_ns))
+    for q in range(MAX_QUEUES):
+        qwin[q].sort()
+    maxwin = [max((e - s for s, e in ws), default=0) for ws in qwin]
+
+    is_exp = [q in config.express_queues for q in queue_of]
+    # 可证明的“永不可发”:最长窗口 <= guard,连一个片段/整帧都开不了
+    transmittable = [maxwin[queue_of[i]] > guard for i in range(n)]
+
+    reasons: list[list[WaitReason]] = [[] for _ in range(n)]
+
+    def note(i: int, r: WaitReason) -> None:
+        if r not in reasons[i]:
+            reasons[i].append(r)
+
+    order = sorted(range(n), key=lambda i: (arrive_of[i], i))
+    remaining = list(size_of)          # preemptable 帧剩余载荷字节
+    frags: list[list] = [[] for _ in range(n)]
+    first_start: list[int | None] = [None] * n
+    last_end: list[int | None] = [None] * n
+    preempted_count = [0] * n
+    done = [False] * n
+    done_cnt = 0
+    total_tx = sum(1 for i in range(n) if transmittable[i])
+
+    exp_ready: list[int] = []          # 已到达未发送的紧急帧
+    new_ready: list[int] = []          # 已到达、从未开始的可抢占帧
+    paused: list[int] = []             # 已暂停(有剩余字节)的可抢占帧
+    pi = 0
+    t = 0
+    busy_until = 0
+    active = -1
+    events = 0
+
+    def startable(q: int, phase: int) -> bool:
+        return any(s <= phase < e and e - phase > guard for s, e in qwin[q])
+
+    while True:
+        events += 1
+        if events > max_events:
+            raise BudgetExhaustedError(
+                f"事件预算 max_events={max_events} 耗尽:重放被截断,"
+                f"这不是“永不可发”的证明"
+            )
+        # 1) 同刻次序第一步:片段/帧完成
+        if active >= 0 and t >= busy_until:
+            i = active
+            active = -1
+            if is_exp[i] or remaining[i] == 0:
+                done[i] = True
+                done_cnt += 1
+            elif i not in paused:
+                paused.append(i)
+        # 2) 同刻次序第三步:帧到达(门状态在决策时按当前相位求值)
+        while pi < n and arrive_of[order[pi]] <= t:
+            i = order[pi]
+            pi += 1
+            if transmittable[i]:
+                (exp_ready if is_exp[i] else new_ready).append(i)
+        if done_cnt >= total_tx:
+            break
+        if t < busy_until:
+            t = busy_until
+            continue
+        phase = (t + offset) % cycle
+
+        # 3) 启动决策:紧急帧 > 暂停帧(按原开始顺序) > 新可抢占帧
+        chosen = -1
+        cands = [i for i in exp_ready if startable(queue_of[i], phase)]
+        if cands:
+            chosen = min(cands, key=lambda i: (arrive_of[i], i))
+            for i in cands:
+                if i != chosen:
+                    note(i, WaitReason.OUTRANKED)
+            for i in paused + new_ready:
+                if startable(queue_of[i], phase):
+                    note(i, WaitReason.PREEMPTED)
+                    preempted_count[i] += 1
+            exp_ready.remove(chosen)
+        else:
+            ps = [i for i in paused if startable(queue_of[i], phase)]
+            if ps:
+                chosen = min(ps, key=lambda i: first_start[i])
+                for i in ps:
+                    if i != chosen:
+                        note(i, WaitReason.OUTRANKED)
+                for i in new_ready:
+                    if startable(queue_of[i], phase):
+                        note(i, WaitReason.OUTRANKED)
+                paused.remove(chosen)
+            else:
+                ns_ = [i for i in new_ready if startable(queue_of[i], phase)]
+                if ns_:
+                    chosen = min(ns_, key=lambda i: (queue_of[i], i))
+                    for i in ns_:
+                        if i != chosen:
+                            note(i, WaitReason.OUTRANKED)
+                    new_ready.remove(chosen)
+
+        if chosen >= 0:
+            i = chosen
+            if is_exp[i]:
+                unit = size_of[i]
+            else:
+                chunk = min(frag_size, remaining[i])
+                unit = chunk + (frag_ov if frags[i] else 0)
+                remaining[i] -= chunk
+            ud = (unit * 8 + rate - 1) // rate
+            frags[i].append((t, t + ud))
+            if first_start[i] is None:
+                first_start[i] = t
+            last_end[i] = t + ud
+            active = i
+            busy_until = t + ud
+            for j in exp_ready + paused + new_ready:
+                note(j, WaitReason.LINK_BUSY)
+                qj = queue_of[j]
+                if not startable(qj, phase):
+                    open_now = any(s <= phase < e for s, e in qwin[qj])
+                    note(j, WaitReason.INSUFFICIENT_WINDOW
+                         if open_now else WaitReason.GATE_CLOSED)
+            t = busy_until
+            continue
+
+        # 4) 无可启动:记录原因,推进到下一个事件点(到达或窗口起点)
+        pending = exp_ready + paused + new_ready
+        for i in pending:
+            q = queue_of[i]
+            open_now = any(s <= phase < e for s, e in qwin[q])
+            note(i, WaitReason.INSUFFICIENT_WINDOW if open_now else WaitReason.GATE_CLOSED)
+        nxt = arrive_of[order[pi]] if pi < n else None
+        for i in pending:
+            for s, _e in qwin[queue_of[i]]:
+                d = (s - phase) % cycle
+                cand_t = t + (d if d > 0 else cycle)
+                if nxt is None or cand_t < nxt:
+                    nxt = cand_t
+        if nxt is None:
+            break  # 只剩永不可发帧
+        t = nxt
+
+    frames_out = []
+    for i in range(n):
+        if not transmittable[i]:
+            frames_out.append(FrameResult(
+                seq=i, queue=queue_of[i], status=FrameStatus.NEVER_TRANSMITTABLE,
+                arrive_ns=arrive_of[i], duration_ns=dur_of[i],
+                start_ns=None, end_ns=None, waited_ns=None, wait_reasons=(),
+                deadline_ns=deadline_of[i], deadline_violated=False,
+            ))
+        else:
+            violated = deadline_of[i] is not None and last_end[i] > deadline_of[i]
+            frames_out.append(FrameResult(
+                seq=i, queue=queue_of[i], status=FrameStatus.SENT,
+                arrive_ns=arrive_of[i], duration_ns=dur_of[i],
+                start_ns=first_start[i], end_ns=last_end[i],
+                waited_ns=first_start[i] - arrive_of[i],
+                wait_reasons=tuple(reasons[i]),
+                deadline_ns=deadline_of[i], deadline_violated=violated,
+                fragments=tuple(frags[i]),
+                preempted_count=preempted_count[i],
+                overhead_bytes=(0 if is_exp[i]
+                                else max(0, len(frags[i]) - 1) * frag_ov),
             ))
     return ReplayResult(
         frames=tuple(frames_out),
