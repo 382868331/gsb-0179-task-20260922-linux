@@ -11,9 +11,10 @@ from tsn_gate import (
     GateWindow,
     TSNGateError,
     WaitReason,
+    WaitSegment,
     replay,
 )
-from reference import reference_replay
+from reference import reference_replay, reference_wait_segments
 
 
 def sched(windows, cycle=100, rate=8, guard=0, offset=0):
@@ -273,6 +274,126 @@ class TestBudget(unittest.TestCase):
         self.assertEqual(r.frames[0].status, FrameStatus.SENT)
 
 
+class TestWaitTimeline(unittest.TestCase):
+    """连续等待时间线:无重叠、无空档,与真实发送时刻对齐。"""
+
+    def assert_timeline(self, f, expected):
+        # expected: [(WaitReason, start_ns, end_ns), ...]
+        got = [(s.reason, s.start_ns, s.end_ns) for s in f.wait_segments]
+        self.assertEqual(got, expected)
+        # 首尾与到达/发送时刻对齐,段间首尾相接
+        if expected:
+            self.assertEqual(f.wait_segments[0].start_ns, f.arrive_ns)
+            self.assertEqual(f.wait_segments[-1].end_ns, f.start_ns)
+        self.assertEqual(
+            sum(s.duration_ns for s in f.wait_segments), f.waited_ns
+        )
+        # breakdown 与 segments 一致,且总量等于 waited_ns
+        self.assertEqual(sum(f.wait_breakdown.values()), f.waited_ns)
+        for s in f.wait_segments:
+            self.assertIn(s.reason, f.wait_breakdown)
+
+    def test_gate_closed_timeline(self):
+        s = sched([GateWindow(50, 60, {0})])
+        f = replay([Frame(queue=0, arrive_ns=0, size_bytes=1)], s).frames[0]
+        self.assertEqual(f.start_ns, 50)
+        self.assert_timeline(f, [(WaitReason.GATE_CLOSED, 0, 50)])
+        self.assertEqual(f.wait_breakdown, {WaitReason.GATE_CLOSED: 50})
+
+    def test_arrive_exactly_at_gate_open_has_empty_timeline(self):
+        # 恰好开门时到达:零等待,时间线为空,不留无法解释的空档
+        s = sched([GateWindow(0, 50, {0})])
+        f = replay([Frame(queue=0, arrive_ns=0, size_bytes=1)], s).frames[0]
+        self.assertEqual(f.waited_ns, 0)
+        self.assert_timeline(f, [])
+        self.assertEqual(f.wait_breakdown, {})
+
+    def test_arrive_at_next_cycle_open_has_empty_timeline(self):
+        s = sched([GateWindow(0, 10, {0})])
+        f = replay([Frame(queue=0, arrive_ns=100, size_bytes=1)], s).frames[0]
+        self.assertEqual((f.start_ns, f.waited_ns), (100, 0))
+        self.assert_timeline(f, [])
+
+    def test_guard_wait_then_gate_closed_across_cycle(self):
+        # 窗口 [0,10),guard 2,时长 5:8 时刻到达,剩余 2 < 7 -> 保护间隔等待;
+        # 10 时刻门关 -> 门未打开,跨周期边界到下一周期开门
+        s = sched([GateWindow(0, 10, {0})], guard=2)
+        f = replay([Frame(queue=0, arrive_ns=8, size_bytes=5)], s).frames[0]
+        self.assertEqual(f.start_ns, 100)
+        self.assert_timeline(f, [
+            (WaitReason.INSUFFICIENT_WINDOW, 8, 10),
+            (WaitReason.GATE_CLOSED, 10, 100),
+        ])
+        self.assertEqual(f.wait_breakdown, {
+            WaitReason.INSUFFICIENT_WINDOW: 2,
+            WaitReason.GATE_CLOSED: 90,
+        })
+
+    def test_link_busy_timeline(self):
+        s = sched([GateWindow(0, 100, {0})])
+        arrivals = [
+            Frame(queue=0, arrive_ns=0, size_bytes=5),  # 占链 [0,5)
+            Frame(queue=0, arrive_ns=1, size_bytes=1),
+        ]
+        f = replay(arrivals, s).frames[1]
+        self.assertEqual(f.start_ns, 5)
+        self.assert_timeline(f, [(WaitReason.LINK_BUSY, 1, 5)])
+        self.assertEqual(f.wait_breakdown, {WaitReason.LINK_BUSY: 4})
+
+    def test_arrival_during_busy_skipped_by_event_jump(self):
+        # 事件跳转跨过到达点:到达落在别人发送期间,整段记 link-busy
+        s = sched([GateWindow(0, 100, {0})])
+        arrivals = [
+            Frame(queue=0, arrive_ns=0, size_bytes=10),  # 占链 [0,10)
+            Frame(queue=0, arrive_ns=4, size_bytes=1),
+        ]
+        f = replay(arrivals, s).frames[1]
+        self.assertEqual(f.start_ns, 10)
+        self.assert_timeline(f, [(WaitReason.LINK_BUSY, 4, 10)])
+
+    def test_mixed_reasons_no_gap_no_overlap(self):
+        # 门未打开 -> 链路被占 -> 保护间隔,三段相接
+        # 窗口:q0 [20,30),q1 [0,100);guard 3
+        s = sched([GateWindow(20, 30, {0}), GateWindow(0, 100, {1})], guard=3)
+        arrivals = [
+            Frame(queue=0, arrive_ns=0, size_bytes=4),   # need 7,等 q0 窗
+            Frame(queue=1, arrive_ns=19, size_bytes=8),  # 到后 q0 帧仍不可发
+        ]
+        r = replay(arrivals, s)
+        f0, f1 = r.frames
+        # f0: [0,19) 门关;19 时刻 f1 到达
+        self.assertEqual(f1.start_ns, 19)
+        self.assert_timeline(f1, [])
+        # f0 全程: [0,19) 门关,[19,27) 链路被 f1 占用,[27,30) 剩余 3 < 7 保护间隔,
+        # [30,120) 门关,120 开门发出
+        self.assertEqual(f0.start_ns, 120)
+        self.assert_timeline(f0, [
+            (WaitReason.GATE_CLOSED, 0, 19),
+            (WaitReason.LINK_BUSY, 19, 27),
+            (WaitReason.INSUFFICIENT_WINDOW, 27, 30),
+            (WaitReason.GATE_CLOSED, 30, 120),
+        ])
+
+    def test_outranked_is_zero_duration_not_in_timeline(self):
+        # 同时到达竞争:outranked 只出现在 wait_reasons,时间线从 link-busy 起算
+        s = sched([GateWindow(0, 100, {0, 1})])
+        arrivals = [
+            Frame(queue=1, arrive_ns=0, size_bytes=1),  # seq0
+            Frame(queue=0, arrive_ns=0, size_bytes=1),  # seq1 先被选中
+        ]
+        f = replay(arrivals, s).frames[0]
+        self.assertIn(WaitReason.OUTRANKED, f.wait_reasons)
+        self.assertEqual(f.start_ns, 1)
+        self.assert_timeline(f, [(WaitReason.LINK_BUSY, 0, 1)])
+
+    def test_never_transmittable_has_empty_timeline(self):
+        s = sched([GateWindow(0, 10, {0})])
+        f = replay([Frame(queue=0, arrive_ns=0, size_bytes=11)], s).frames[0]
+        self.assertEqual(f.status, FrameStatus.NEVER_TRANSMITTABLE)
+        self.assertEqual(f.wait_segments, ())
+        self.assertEqual(f.wait_breakdown, {})
+
+
 class TestAgainstTickReference(unittest.TestCase):
     """确定性随机小整数用例:事件驱动核心 vs 独立逐 tick 参考。"""
 
@@ -318,6 +439,9 @@ class TestAgainstTickReference(unittest.TestCase):
             arrivals = [Frame(queue=q, arrive_ns=a, size_bytes=z, deadline_ns=d)
                         for (q, a, z, d) in frames]
             expected = reference_replay(frames, windows, cycle, rate, guard, offset)
+            expected_segs = reference_wait_segments(
+                frames, windows, cycle, rate, guard, offset
+            )
             result = replay(arrivals, schedule)
             for i, (exp, got) in enumerate(zip(expected, result.frames)):
                 if exp == (None, None):
@@ -329,6 +453,26 @@ class TestAgainstTickReference(unittest.TestCase):
                     self.assertEqual(
                         (got.start_ns, got.end_ns), exp,
                         f"case {case} frame {i}: 核心与逐 tick 参考不一致",
+                    )
+                    got_segs = [(s.reason.value, s.start_ns, s.end_ns)
+                                for s in got.wait_segments]
+                    self.assertEqual(
+                        got_segs, expected_segs[i],
+                        f"case {case} frame {i}: 等待时间线与逐 tick 参考不一致",
+                    )
+                    self.assertEqual(
+                        got.wait_segments[0].start_ns if got.wait_segments
+                        else got.arrive_ns,
+                        got.arrive_ns,
+                    )
+                    self.assertEqual(
+                        got.wait_segments[-1].end_ns if got.wait_segments
+                        else got.start_ns,
+                        got.start_ns,
+                    )
+                    self.assertEqual(
+                        sum(s.duration_ns for s in got.wait_segments),
+                        got.waited_ns,
                     )
 
 

@@ -46,7 +46,16 @@ result = replay(arrivals, schedule, max_events=1_000_000)
 | `start_ns` / `end_ns` | 发送开始/结束(参考时钟;永不可发为 `None`) |
 | `waited_ns` | `start_ns - arrive_ns` |
 | `wait_reasons` | 等待期间出现过的原因:`gate-closed`、`insufficient-window`、`link-busy`、`outranked` |
+| `wait_segments` | 连续等待时间线:若干半开区间 `WaitSegment(reason, start_ns, end_ns)`,按时间升序首尾相接,覆盖 `[arrive_ns, start_ns)`,不重叠、不留空档;永不可发/零等待为空元组 |
+| `wait_breakdown` | 各原因累计等待纳秒(`WaitReason -> int`,仅含非零项),各项之和恒等于 `waited_ns` |
 | `deadline_ns` / `deadline_violated` | 截止时间与是否违例(`end_ns > deadline_ns`;帧仍发送,不丢弃) |
+
+等待时间线把同一时刻可能满足的多个限制按**一个**原因记账,不存在重复累加:链路被
+占用优先记 `link-busy`(链路空闲前帧本就无法开始);链路空闲时队列门未开记
+`gate-closed`;门开着但剩余窗口容不下“序列化时长 + guard”记 `insufficient-window`
+(即保护间隔造成的等待)。`outranked` 只发生在离散的发送裁决瞬间,持续时间为零,
+不进入时间线(仍出现在 `wait_reasons` 中)。跨周期边界、帧恰好在开门时刻到达
+(零等待、空时间线)等情形由单元测试和逐 tick 参考随机对照覆盖。
 
 `ReplayResult` 另有 `sent_count`、`never_count`、`deadline_violations`(违例帧 seq 元组)。
 
@@ -96,7 +105,9 @@ result = replay(arrivals, schedule, max_events=1_000_000)
 - 只实现本题契约的有限子集,**不宣称兼容完整 IEEE 802.1Qbv**:无帧抢占、
   无逐队列 guard、无多跳/多链路、无时钟漂移(仅固定偏差)、无控制面。
 - guard 为全局单值;deadline 违例只报告不阻止发送。
-- 等待原因为定性标签(出现过的原因集合),不输出逐段等待时间线。
+- 等待时间线按 link-busy > gate-closed/insufficient-window 的优先级归因:同一
+  时刻满足多个限制时只记一个原因;不按帧级独立仿真归因(链路占用期间各队列
+  门状态的变化不在占用等待内细分)。
 
 ## 运行
 

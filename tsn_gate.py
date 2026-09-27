@@ -15,6 +15,11 @@
   NEVER_TRANSMITTABLE(永不可发),不参与等待,不会死循环。
 - 事件预算 max_events 耗尽时抛出 BudgetExhaustedError,
   与“已证明永不可发”是两种不同的结论,互不混淆。
+- 等待时间线:每个已发送帧附带 wait_segments,一串半开区间 [start_ns, end_ns)
+  的连续记录,从 arrive_ns 无空档、无重叠地拼接到发送开始时刻,每段归属恰好
+  一个原因:门未打开(gate-closed)、保护间隔导致剩余窗口不足
+  (insufficient-window)、链路被占用(link-busy)。outranked 只发生在离散的
+  裁决瞬间,时长为零,不进入时间线,仅保留在 wait_reasons 中。
 
 本模块只实现本题契约的有限子集,不宣称兼容完整 IEEE 802.1Qbv。
 """
@@ -32,6 +37,7 @@ __all__ = [
     "BudgetExhaustedError",
     "WaitReason",
     "FrameStatus",
+    "WaitSegment",
     "Frame",
     "GateWindow",
     "GateSchedule",
@@ -62,6 +68,23 @@ class WaitReason(str, Enum):
 class FrameStatus(str, Enum):
     SENT = "sent"
     NEVER_TRANSMITTABLE = "never-transmittable"
+
+
+@dataclass(frozen=True)
+class WaitSegment:
+    """一段连续的等待记录:半开区间 [start_ns, end_ns) 内等待原因恒为 reason。
+
+    同一帧的所有段按时间升序首尾相接,覆盖 [arrive_ns, 发送开始时刻),
+    不重叠、不留空档;各段时长之和恒等于 waited_ns。
+    """
+
+    reason: WaitReason
+    start_ns: int
+    end_ns: int
+
+    @property
+    def duration_ns(self) -> int:
+        return self.end_ns - self.start_ns
 
 
 def _require_int(value, where: str, lo=None, hi=None) -> int:
@@ -173,6 +196,8 @@ class FrameResult:
     end_ns: int | None
     waited_ns: int | None         # start_ns - arrive_ns
     wait_reasons: tuple           # 等待期间出现过的原因(WaitReason,按首次出现排序)
+    wait_segments: tuple          # 连续等待时间线(WaitSegment,无重叠无空档)
+    wait_breakdown: dict          # 各原因累计等待 ns(WaitReason -> int,仅非零项)
     deadline_ns: int | None
     deadline_violated: bool       # end_ns > deadline_ns(帧仍发送,不丢弃)
 
@@ -239,6 +264,18 @@ def replay(arrivals, gate_schedule, *, max_events=DEFAULT_MAX_EVENTS) -> ReplayR
         if r not in reasons[i]:
             reasons[i].append(r)
 
+    segs: list[list[WaitSegment]] = [[] for _ in range(n)]
+
+    def record(i: int, r: WaitReason, t0: int, t1: int) -> None:
+        """为帧 i 记录一段 [t0, t1) 的等待;与上一段同因且相接时合并。"""
+        if t1 <= t0:
+            return
+        if segs[i] and segs[i][-1].reason is r and segs[i][-1].end_ns == t0:
+            prev = segs[i].pop()
+            segs[i].append(WaitSegment(r, prev.start_ns, t1))
+        else:
+            segs[i].append(WaitSegment(r, t0, t1))
+
     order = sorted(range(n), key=lambda i: (arrive_of[i], i))
     start_of: list[int | None] = [None] * n
     end_of: list[int | None] = [None] * n
@@ -260,6 +297,10 @@ def replay(arrivals, gate_schedule, *, max_events=DEFAULT_MAX_EVENTS) -> ReplayR
             i = order[pi]
             pi += 1
             if transmittable[i]:
+                if arrive_of[i] < t:
+                    # 该帧在链路占用期间到达(占用开始前的到达必已在当时入列),
+                    # 从到达到现在链路一直被占。
+                    record(i, WaitReason.LINK_BUSY, arrive_of[i], t)
                 ready.append(i)
         if not ready:
             if pi >= n:
@@ -267,6 +308,8 @@ def replay(arrivals, gate_schedule, *, max_events=DEFAULT_MAX_EVENTS) -> ReplayR
             t = max(t, busy_until, arrive_of[order[pi]])
             continue
         if t < busy_until:
+            for i in ready:
+                record(i, WaitReason.LINK_BUSY, t, busy_until)
             t = busy_until
             continue
 
@@ -292,14 +335,18 @@ def replay(arrivals, gate_schedule, *, max_events=DEFAULT_MAX_EVENTS) -> ReplayR
             ready.remove(chosen)
             for i in ready:
                 note(i, WaitReason.LINK_BUSY)
+                record(i, WaitReason.LINK_BUSY, t, end)
             t = end
             continue
 
         # 没有帧能在当前时刻开始:记录原因,推进到下一个事件点
+        hold: dict[int, WaitReason] = {}
         for i in ready:
             q = queue_of[i]
             open_now = any(s <= phase < e for s, e in qwin[q])
-            note(i, WaitReason.INSUFFICIENT_WINDOW if open_now else WaitReason.GATE_CLOSED)
+            hold[i] = (WaitReason.INSUFFICIENT_WINDOW if open_now
+                       else WaitReason.GATE_CLOSED)
+            note(i, hold[i])
         nxt = arrive_of[order[pi]] if pi < n else None
         for i in ready:
             for s, e in qwin[queue_of[i]]:
@@ -312,6 +359,9 @@ def replay(arrivals, gate_schedule, *, max_events=DEFAULT_MAX_EVENTS) -> ReplayR
                         nxt = cand_t
         if nxt is None or nxt <= t:
             raise TSNGateError("内部错误:事件时间未能推进(不应发生)")
+        # [t, nxt) 内无窗口边沿、无新到达,各帧等待原因保持不变
+        for i in ready:
+            record(i, hold[i], t, nxt)
         t = nxt
 
     frames_out = []
@@ -321,9 +371,27 @@ def replay(arrivals, gate_schedule, *, max_events=DEFAULT_MAX_EVENTS) -> ReplayR
                 seq=i, queue=queue_of[i], status=FrameStatus.NEVER_TRANSMITTABLE,
                 arrive_ns=arrive_of[i], duration_ns=dur_of[i],
                 start_ns=None, end_ns=None, waited_ns=None, wait_reasons=(),
+                wait_segments=(), wait_breakdown={},
                 deadline_ns=deadline_of[i], deadline_violated=False,
             ))
         else:
+            # 时间线自检:必须从 arrive_ns 无空档、无重叠地拼接到 start_ns
+            cursor = arrive_of[i]
+            for seg in segs[i]:
+                if seg.start_ns != cursor or seg.end_ns <= seg.start_ns:
+                    raise TSNGateError(
+                        f"内部错误:帧 {i} 等待时间线在 {cursor} 处断裂(不应发生)"
+                    )
+                cursor = seg.end_ns
+            if cursor != start_of[i]:
+                raise TSNGateError(
+                    f"内部错误:帧 {i} 等待时间线终点 {cursor} 与发送开始 "
+                    f"{start_of[i]} 不一致(不应发生)"
+                )
+            breakdown: dict[WaitReason, int] = {}
+            for seg in segs[i]:
+                breakdown[seg.reason] = (breakdown.get(seg.reason, 0)
+                                         + seg.duration_ns)
             violated = deadline_of[i] is not None and end_of[i] > deadline_of[i]
             frames_out.append(FrameResult(
                 seq=i, queue=queue_of[i], status=FrameStatus.SENT,
@@ -331,6 +399,8 @@ def replay(arrivals, gate_schedule, *, max_events=DEFAULT_MAX_EVENTS) -> ReplayR
                 start_ns=start_of[i], end_ns=end_of[i],
                 waited_ns=start_of[i] - arrive_of[i],
                 wait_reasons=tuple(reasons[i]),
+                wait_segments=tuple(segs[i]),
+                wait_breakdown=breakdown,
                 deadline_ns=deadline_of[i], deadline_violated=violated,
             ))
     return ReplayResult(
