@@ -60,3 +60,33 @@ def reference_replay(frames, windows, cycle, rate, guard, offset, tick_limit=5_0
         remaining.discard(best)
         t = busy_until
     return [(start[i], end[i]) if not never[i] else (None, None) for i in range(n)]
+
+
+def reference_wait_segments(frames, windows, cycle, rate, guard, offset, seq):
+    """逐纳秒独立复算帧 seq 的连续等待段,返回 [(reason_str, ns), ...]。
+
+    归因规则(与题面约定一致,独立重述):每个等待中的纳秒
+      1. 该队列门未开            -> "gate-closed"
+      2. 门开但剩余窗口 < 时长+guard -> "insufficient-window"
+      3. 否则(链路必被占用)     -> "link-busy"
+    相邻同因段合并;段总长必须等于 start - arrive。
+    """
+    timeline = reference_replay(frames, windows, cycle, rate, guard, offset)
+    start, _end = timeline[seq]
+    assert start is not None, "永不可发的帧没有等待段"
+    dur = (frames[seq][2] * 8 + rate - 1) // rate
+    need = dur + guard
+    q, arrive = frames[seq][0], frames[seq][1]
+    segs = []
+    for t in range(arrive, start):
+        phase = (t + offset) % cycle
+        reason = "gate-closed"
+        for (s, e, qs) in windows:
+            if q in qs and s <= phase < e:
+                reason = "insufficient-window" if e - phase < need else "link-busy"
+                break
+        if segs and segs[-1][0] == reason:
+            segs[-1][1] += 1
+        else:
+            segs.append([reason, 1])
+    return [(r, ns) for r, ns in segs]

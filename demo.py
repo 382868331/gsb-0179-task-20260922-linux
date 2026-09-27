@@ -51,6 +51,11 @@ def show_normal_case() -> None:
         waited = "-" if f.waited_ns is None else str(f.waited_ns)
         print(f"{f.seq:>3} {f.queue:>4} {f.arrive_ns:>6} {f.status.value:>22} "
               f"{start:>6} {end:>6} {waited:>5}  {reasons} / {dl}")
+        if f.wait_segments:
+            segs = " -> ".join(f"{r.value} {ns}ns" for r, ns in f.wait_segments)
+            totals = ", ".join(f"{r.value}={ns}ns"
+                               for r, ns in f.wait_totals.items())
+            print(f"{'':>3} 等待时间线: {segs}  (合计 {totals})")
     print(f"汇总: 发送 {result.sent_count} 帧, 永不可发 {result.never_count} 帧, "
           f"deadline 违例 seq={list(result.deadline_violations)}")
     assert result.frames[1].deadline_violated, "演示场景应触发 deadline 违例"
